@@ -1,6 +1,7 @@
 import os
 import json
-from typing import List, Dict
+import random
+from typing import List, Dict, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -94,9 +95,37 @@ waiting_queue: List[Dict[str, str]] = []
 class PlayerRequest(BaseModel):
     username: str
 
+class GuestRequest(BaseModel):
+    username: Optional[str] = None
+
 @app.get("/")
 def read_root():
     return {"status": "ok", "message": "Chess Magic Backend is running!"}
+
+# 🟢 NEW: Instant Guest Game Endpoint
+@app.post("/api/game/start-guest")
+def start_guest_game(req: GuestRequest, db: Session = Depends(get_db)):
+    # Clean username or fallback to Guest_XXXX
+    user_name = req.username.strip() if (req.username and req.username.strip()) else f"Guest_{random.randint(1000, 9999)}"
+    
+    new_game = ChessGame(
+        fen=STARTING_FEN,
+        pgn="",
+        white_player=user_name,
+        black_player="Guest Opponent"
+    )
+    db.add(new_game)
+    db.commit()
+    db.refresh(new_game)
+
+    return {
+        "status": "SUCCESS",
+        "gameId": str(new_game.id),
+        "color": "w",
+        "whitePlayer": new_game.white_player,
+        "blackPlayer": new_game.black_player,
+        "fen": new_game.fen
+    }
 
 @app.post("/api/game/matchmake")
 def matchmake(req: PlayerRequest, db: Session = Depends(get_db)):
