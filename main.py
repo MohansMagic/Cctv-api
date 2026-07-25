@@ -95,7 +95,7 @@ async def websocket_endpoint(
 ):
     await manager.connect(websocket, game_id)
     try:
-        # Fetch existing game or create a new row
+        # Fetch existing game or create a new row on initial connection
         game = db.query(ChessGame).filter(ChessGame.id == game_id).first()
         if not game:
             game = ChessGame(id=game_id)
@@ -110,7 +110,7 @@ async def websocket_endpoint(
         db.commit()
         db.refresh(game)
 
-        # Broadcast state & player profiles to everyone in the room
+        # Broadcast initial state & player profiles to room
         await manager.broadcast(game_id, {
             "type": "PLAYER_JOINED",
             "fen": game.fen,
@@ -127,8 +127,11 @@ async def websocket_endpoint(
             if message.get("type") == "MOVE":
                 move_uci = message.get("move")
                 
+                # --- FIX: ALWAYS RE-FETCH LATEST GAME STATE FROM DB ---
+                game = db.query(ChessGame).filter(ChessGame.id == game_id).first()
+                
                 # Apply move server-side using python-chess
-                board = chess.Board(game.fen if game.fen else chess.STARTING_FEN)
+                board = chess.Board(game.fen if (game and game.fen) else chess.STARTING_FEN)
                 try:
                     move = chess.Move.from_uci(move_uci)
                     if move in board.legal_moves:
@@ -137,7 +140,7 @@ async def websocket_endpoint(
                         game.pgn = message.get("pgn", game.pgn)
                         db.commit()
 
-                        # Broadcast updated board state to both clients
+                        # Broadcast updated board state to all connected clients
                         await manager.broadcast(game_id, {
                             "type": "UPDATE",
                             "fen": game.fen,
