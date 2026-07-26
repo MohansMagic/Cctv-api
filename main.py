@@ -9,7 +9,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
-# Standard starting FEN constant (no need for external chess library)
+# Standard starting FEN constant
 STARTING_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 
 # ==========================================
@@ -25,13 +25,12 @@ engine = create_engine(DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# Database Model
 class ChessGame(Base):
     __tablename__ = "chess_games"
 
     id = Column(Integer, primary_key=True, index=True)
     fen = Column(Text, default=STARTING_FEN)
-    pgn = Column(Text, default="")  # Stores PGN string sent from Angular
+    pgn = Column(Text, default="")
     white_player = Column(String, nullable=True)
     black_player = Column(String, nullable=True)
 
@@ -93,7 +92,7 @@ manager = ConnectionManager()
 waiting_queue: List[Dict[str, str]] = []
 
 class PlayerRequest(BaseModel):
-    username: str
+    username: Optional[str] = None
 
 class GuestRequest(BaseModel):
     username: Optional[str] = None
@@ -102,41 +101,19 @@ class GuestRequest(BaseModel):
 def read_root():
     return {"status": "ok", "message": "Chess Magic Backend is running!"}
 
-# 🟢 NEW: Instant Guest Game Endpoint
-@app.post("/api/game/start-guest")
-def start_guest_game(req: GuestRequest, db: Session = Depends(get_db)):
-    # Clean username or fallback to Guest_XXXX
-    user_name = req.username.strip() if (req.username and req.username.strip()) else f"Guest_{random.randint(1000, 9999)}"
-    
-    new_game = ChessGame(
-        fen=STARTING_FEN,
-        pgn="",
-        white_player=user_name,
-        black_player="Guest Opponent"
-    )
-    db.add(new_game)
-    db.commit()
-    db.refresh(new_game)
-
-    return {
-        "status": "SUCCESS",
-        "gameId": str(new_game.id),
-        "color": "w",
-        "whitePlayer": new_game.white_player,
-        "blackPlayer": new_game.black_player,
-        "fen": new_game.fen
-    }
-
+# 🟢 Queue Matchmaking (Registered users)
 @app.post("/api/game/matchmake")
 def matchmake(req: PlayerRequest, db: Session = Depends(get_db)):
     global waiting_queue
 
-    if any(p["username"] == req.username for p in waiting_queue):
-        return {"status": "WAITING", "message": "Already waiting in queue..."}
+    username = req.username.strip() if (req.username and req.username.strip()) else f"Guest_{random.randint(1000, 9999)}"
+
+    if any(p["username"] == username for p in waiting_queue):
+        return {"status": "WAITING", "username": username, "message": "Already waiting in queue..."}
 
     if len(waiting_queue) > 0:
-        player1 = waiting_queue.pop(0)  # White
-        player2 = req.username          # Black
+        player1 = waiting_queue.pop(0)
+        player2 = username
 
         new_game = ChessGame(
             fen=STARTING_FEN,
@@ -152,13 +129,61 @@ def matchmake(req: PlayerRequest, db: Session = Depends(get_db)):
             "status": "MATCHED",
             "gameId": str(new_game.id),
             "color": "b",
+            "username": player2,
             "whitePlayer": player1["username"],
-            "blackPlayer": player2
+            "blackPlayer": player2,
+            "fen": new_game.fen
         }
 
-    waiting_queue.append({"username": req.username})
+    waiting_queue.append({"username": username})
     return {
         "status": "WAITING",
+        "username": username,
+        "message": "Looking for opponent..."
+    }
+
+# 🟢 Queue Matchmaking (Guest players)
+@app.post("/api/game/start-guest")
+def start_guest_game(req: GuestRequest, db: Session = Depends(get_db)):
+    global waiting_queue
+
+    username = req.username.strip() if (req.username and req.username.strip()) else f"Guest_{random.randint(1000, 9999)}"
+
+    if any(p["username"] == username for p in waiting_queue):
+        return {
+            "status": "WAITING",
+            "username": username,
+            "message": "Already waiting in queue..."
+        }
+
+    if len(waiting_queue) > 0:
+        player1 = waiting_queue.pop(0)  # White
+        player2 = username             # Black
+
+        new_game = ChessGame(
+            fen=STARTING_FEN,
+            pgn="",
+            white_player=player1["username"],
+            black_player=player2
+        )
+        db.add(new_game)
+        db.commit()
+        db.refresh(new_game)
+
+        return {
+            "status": "MATCHED",
+            "gameId": str(new_game.id),
+            "color": "b",
+            "username": player2,
+            "whitePlayer": player1["username"],
+            "blackPlayer": player2,
+            "fen": new_game.fen
+        }
+
+    waiting_queue.append({"username": username})
+    return {
+        "status": "WAITING",
+        "username": username,
         "message": "Looking for opponent..."
     }
 
@@ -185,7 +210,7 @@ def check_status(username: str, db: Session = Depends(get_db)):
 
 
 # ==========================================
-# 5. WEBSOCKET REAL-TIME GAMEPLAY (CLIENT-VALIDATED)
+# 5. WEBSOCKET REAL-TIME GAMEPLAY
 # ==========================================
 @app.websocket("/ws/game/{game_id}/{color}/{username}")
 async def websocket_endpoint(
@@ -198,8 +223,8 @@ async def websocket_endpoint(
     await manager.connect(game_id, websocket)
     
     try:
-        # 1. Send stored initial FEN & PGN to connecting player
         game = db.query(ChessGame).filter(ChessGame.id == int(game_id)).first()
+        
         if game:
             await websocket.send_json({
                 "type": "INIT",
@@ -209,7 +234,6 @@ async def websocket_endpoint(
                 "blackPlayer": game.black_player
             })
 
-        # 2. Receive and relay client-validated move payloads
         while True:
             data = await websocket.receive_json()
 
@@ -223,12 +247,10 @@ async def websocket_endpoint(
                     await websocket.send_json({"type": "ERROR", "message": "Game not found"})
                     continue
 
-                # Store updated state directly to DB
                 game.fen = incoming_fen
                 game.pgn = incoming_pgn
                 db.commit()
 
-                # Broadcast updated FEN and PGN to all players connected to this game
                 await manager.broadcast(game_id, {
                     "type": "MOVE",
                     "move": move_played,
