@@ -117,7 +117,7 @@ def matchmake(req: PlayerRequest, db: Session = Depends(get_db)):
 
         new_game = ChessGame(
             fen=STARTING_FEN,
-            pgn="",
+            pgn="",  # Left empty; Angular will construct and send the PGN
             white_player=player1["username"],
             black_player=player2
         )
@@ -158,11 +158,11 @@ def start_guest_game(req: GuestRequest, db: Session = Depends(get_db)):
 
     if len(waiting_queue) > 0:
         player1 = waiting_queue.pop(0)  # White
-        player2 = username             # Black
+        player2 = username              # Black
 
         new_game = ChessGame(
             fen=STARTING_FEN,
-            pgn="",
+            pgn="",  # Left empty; Angular will construct and send the PGN
             white_player=player1["username"],
             black_player=player2
         )
@@ -217,14 +217,14 @@ async def websocket_endpoint(
     websocket: WebSocket,
     game_id: str,
     color: str,
-    username: str,
-    db: Session = Depends(get_db)
+    username: str
 ):
     await manager.connect(game_id, websocket)
-    
+
+    # Initial state push on connect
+    db_init = SessionLocal()
     try:
-        game = db.query(ChessGame).filter(ChessGame.id == int(game_id)).first()
-        
+        game = db_init.query(ChessGame).filter(ChessGame.id == int(game_id)).first()
         if game:
             await websocket.send_json({
                 "type": "INIT",
@@ -233,24 +233,35 @@ async def websocket_endpoint(
                 "whitePlayer": game.white_player,
                 "blackPlayer": game.black_player
             })
+    finally:
+        db_init.close()
 
+    try:
         while True:
             data = await websocket.receive_json()
 
             if data.get("type") == "MOVE":
                 incoming_fen = data.get("fen")
-                incoming_pgn = data.get("pgn")
+                incoming_pgn = data.get("pgn")  # Exact PGN formatted by Angular
                 move_played = data.get("move")
 
-                game = db.query(ChessGame).filter(ChessGame.id == int(game_id)).first()
-                if not game:
-                    await websocket.send_json({"type": "ERROR", "message": "Game not found"})
-                    continue
+                # Fresh DB session per move to ensure direct write to PostgreSQL
+                db = SessionLocal()
+                try:
+                    game = db.query(ChessGame).filter(ChessGame.id == int(game_id)).first()
+                    if game:
+                        if incoming_fen:
+                            game.fen = incoming_fen
+                        if incoming_pgn is not None:
+                            game.pgn = incoming_pgn  # Save exact Angular PGN directly
+                        db.commit()
+                except Exception as e:
+                    db.rollback()
+                    print(f"Error persisting move to DB: {e}")
+                finally:
+                    db.close()
 
-                game.fen = incoming_fen
-                game.pgn = incoming_pgn
-                db.commit()
-
+                # Broadcast exact incoming data back to clients
                 await manager.broadcast(game_id, {
                     "type": "MOVE",
                     "move": move_played,
