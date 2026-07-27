@@ -218,7 +218,6 @@ def check_status(username: str, db: Session = Depends(get_db)):
 # ==========================================
 # 5. WEBSOCKET REAL-TIME GAMEPLAY
 # ==========================================
-
 @app.websocket("/ws/game/{game_id}/{color}/{username}")
 async def websocket_endpoint(
     websocket: WebSocket,
@@ -227,20 +226,12 @@ async def websocket_endpoint(
     username: str
 ):
     await manager.connect(game_id, websocket)
+    print(f"🟢 [WS CONNECTED] Game: {game_id} | User: {username} | Color: {color}", flush=True)
 
-    print(
-        f"🟢 [WS CONNECTED] Game:{game_id} User:{username} Color:{color}",
-        flush=True
-    )
-
-    # Send initial state
+    # Initial state push on connect
     db_init = SessionLocal()
-
     try:
-        game = db_init.query(ChessGame)\
-            .filter(ChessGame.id == int(game_id))\
-            .first()
-
+        game = db_init.query(ChessGame).filter(ChessGame.id == int(game_id)).first()
         if game:
             init_payload = {
                 "type": "INIT",
@@ -249,140 +240,59 @@ async def websocket_endpoint(
                 "whitePlayer": game.white_player,
                 "blackPlayer": game.black_player
             }
-
-            print(
-                "📤 INIT SENT:",
-                json.dumps(init_payload, indent=2),
-                flush=True
-            )
-
+            print(f"📤 [WS INIT SENT] To {username}:", json.dumps(init_payload, indent=2), flush=True)
             await websocket.send_json(init_payload)
-
     finally:
         db_init.close()
 
-
     try:
-
         while True:
-
             data = await websocket.receive_json()
 
-
-            print("=" * 50)
-            print(
-                f"📥 RECEIVED Game:{game_id} User:{username}",
-                flush=True
-            )
-            print(
-                json.dumps(data, indent=2),
-                flush=True
-            )
-            print("=" * 50)
-
+            # 🔍 LOG INCOMING WEBSOCKET PAYLOAD FROM ANGULAR
+            print(f"==================================================", flush=True)
+            print(f"📥 [WS RECEIVED] Game: {game_id} | From: {username}", flush=True)
+            print(f"Payload: {json.dumps(data, indent=2)}", flush=True)
+            print(f"==================================================", flush=True)
 
             msg_type = data.get("type")
+            incoming_fen = data.get("fen")
+            incoming_pgn = data.get("pgn")
+            move_played = data.get("move")
 
-
-            # =====================================
-            # Ignore INIT coming from clients
-            # =====================================
-            if msg_type == "INIT":
-                print(
-                    "⚠️ Ignoring client INIT",
-                    flush=True
-                )
-                continue
-
-
-
-            # =====================================
-            # MOVE HANDLER
-            # =====================================
-            if msg_type == "MOVE":
-
-                incoming_fen = data.get("fen")
-                incoming_pgn = data.get("pgn")
-                move_played = data.get("move")
-
-
+            # 💾 PERSISTENCE CHECK:
+            # Save whenever non-empty pgn or fen is received regardless of msg_type
+            if (incoming_pgn and incoming_pgn.strip()) or incoming_fen:
                 db = SessionLocal()
-
                 try:
-
-                    game = db.query(ChessGame)\
-                        .filter(ChessGame.id == int(game_id))\
-                        .first()
-
-
+                    game = db.query(ChessGame).filter(ChessGame.id == int(game_id)).first()
                     if game:
-
                         if incoming_fen:
                             game.fen = incoming_fen
-
-
-                        if incoming_pgn is not None:
-                            game.pgn = incoming_pgn
-
-
+                        if incoming_pgn and incoming_pgn.strip():
+                            game.pgn = incoming_pgn  # Save exact Angular PGN directly
                         db.commit()
-
-
-                        print(
-                            f"💾 SAVED Game {game_id}",
-                            flush=True
-                        )
-
-
+                        print(f"💾 [DB SAVED] Game {game_id} updated with new PGN & FEN.", flush=True)
                 except Exception as e:
-
                     db.rollback()
-
-                    print(
-                        "❌ DATABASE ERROR:",
-                        e,
-                        flush=True
-                    )
-
+                    print(f"❌ [DB ERROR] Failed to save move: {e}", flush=True)
                 finally:
-
                     db.close()
 
-
-
-                await manager.broadcast(
-                    game_id,
-                    {
-                        "type": "MOVE",
-                        "move": move_played,
-                        "fen": incoming_fen,
-                        "pgn": incoming_pgn,
-                        "sender": username,
-                        "whitePlayer": game.white_player if game else None,
-                        "blackPlayer": game.black_player if game else None
-                    }
-                )
-
+            # Broadcast move back to room clients if a move occurred
+            if msg_type == "MOVE":
+                await manager.broadcast(game_id, {
+                    "type": "MOVE",
+                    "move": move_played,
+                    "fen": incoming_fen,
+                    "pgn": incoming_pgn,
+                    "sender": username
+                })
 
     except WebSocketDisconnect:
-
-
-        manager.disconnect(
-            game_id,
-            websocket
-        )
-
-
-        print(
-            f"🔴 DISCONNECTED Game:{game_id} User:{username}",
-            flush=True
-        )
-
-
-        await manager.broadcast(
-            game_id,
-            {
-                "type": "SYSTEM",
-                "message": f"{username} disconnected"
-            }
-        )
+        manager.disconnect(game_id, websocket)
+        print(f"🔴 [WS DISCONNECTED] Game: {game_id} | User: {username}", flush=True)
+        await manager.broadcast(game_id, {
+            "type": "SYSTEM",
+            "message": f"Player {username} disconnected."
+        })
