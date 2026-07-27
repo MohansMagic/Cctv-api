@@ -1,11 +1,12 @@
 import os
 import json
+import time
 import random
 from typing import List, Dict, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Text
+from sqlalchemy import create_engine, Column, Integer, String, Text, Float
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
@@ -33,6 +34,12 @@ class ChessGame(Base):
     pgn = Column(Text, default="")
     white_player = Column(String, nullable=True)
     black_player = Column(String, nullable=True)
+
+    # ⏱️ CLOCK FIELDS (Stored in seconds)
+    white_time = Column(Float, default=300.0)      # Default: 5 minutes (300s)
+    black_time = Column(Float, default=300.0)      # Default: 5 minutes (300s)
+    increment = Column(Float, default=0.0)         # Increment per move in seconds
+    last_move_time = Column(Float, nullable=True)  # Unix timestamp of last move
 
 Base.metadata.create_all(bind=engine)
 
@@ -125,7 +132,11 @@ def matchmake(req: PlayerRequest, db: Session = Depends(get_db)):
             fen=STARTING_FEN,
             pgn="",  # Left empty; Angular will construct and send the PGN
             white_player=player1["username"],
-            black_player=player2
+            black_player=player2,
+            white_time=300.0,
+            black_time=300.0,
+            increment=0.0,
+            last_move_time=None
         )
         db.add(new_game)
         db.commit()
@@ -138,7 +149,9 @@ def matchmake(req: PlayerRequest, db: Session = Depends(get_db)):
             "username": player2,
             "whitePlayer": player1["username"],
             "blackPlayer": player2,
-            "fen": new_game.fen
+            "fen": new_game.fen,
+            "whiteTime": new_game.white_time,
+            "blackTime": new_game.black_time
         }
 
     waiting_queue.append({"username": username})
@@ -170,7 +183,11 @@ def start_guest_game(req: GuestRequest, db: Session = Depends(get_db)):
             fen=STARTING_FEN,
             pgn="",  # Left empty; Angular will construct and send the PGN
             white_player=player1["username"],
-            black_player=player2
+            black_player=player2,
+            white_time=300.0,
+            black_time=300.0,
+            increment=0.0,
+            last_move_time=None
         )
         db.add(new_game)
         db.commit()
@@ -183,7 +200,9 @@ def start_guest_game(req: GuestRequest, db: Session = Depends(get_db)):
             "username": player2,
             "whitePlayer": player1["username"],
             "blackPlayer": player2,
-            "fen": new_game.fen
+            "fen": new_game.fen,
+            "whiteTime": new_game.white_time,
+            "blackTime": new_game.black_time
         }
 
     waiting_queue.append({"username": username})
@@ -238,7 +257,10 @@ async def websocket_endpoint(
                 "fen": game.fen,
                 "pgn": game.pgn or "",
                 "whitePlayer": game.white_player,
-                "blackPlayer": game.black_player
+                "blackPlayer": game.black_player,
+                "whiteTime": game.white_time,
+                "blackTime": game.black_time,
+                "lastMoveTime": game.last_move_time
             }
             print(f"📤 [WS INIT SENT] To {username}:", json.dumps(init_payload, indent=2), flush=True)
             await websocket.send_json(init_payload)
@@ -260,34 +282,51 @@ async def websocket_endpoint(
             incoming_pgn = data.get("pgn")
             move_played = data.get("move")
 
-            # 💾 PERSISTENCE CHECK:
-            # Save whenever non-empty pgn or fen is received regardless of msg_type
+            now = time.time()
+
+            # 💾 PERSISTENCE & TIMER CHECK:
             if (incoming_pgn and incoming_pgn.strip()) or incoming_fen:
                 db = SessionLocal()
                 try:
                     game = db.query(ChessGame).filter(ChessGame.id == int(game_id)).first()
                     if game:
+                        # Process move time deduction
+                        if msg_type == "MOVE" and game.last_move_time is not None:
+                            elapsed = now - game.last_move_time
+                            # If incoming_fen indicates Black's turn next (" b "), White made the move
+                            if incoming_fen and " b " in incoming_fen:
+                                game.white_time = max(0.0, game.white_time - elapsed + game.increment)
+                            else:
+                                game.black_time = max(0.0, game.black_time - elapsed + game.increment)
+
+                        if msg_type == "MOVE":
+                            game.last_move_time = now
+
                         if incoming_fen:
                             game.fen = incoming_fen
                         if incoming_pgn and incoming_pgn.strip():
                             game.pgn = incoming_pgn  # Save exact Angular PGN directly
+
                         db.commit()
-                        print(f"💾 [DB SAVED] Game {game_id} updated with new PGN & FEN.", flush=True)
+                        print(f"💾 [DB SAVED] Game {game_id} updated with new PGN, FEN & Timers.", flush=True)
+
+                        # Broadcast move back to room clients
+                        if msg_type == "MOVE":
+                            await manager.broadcast(game_id, {
+                                "type": "MOVE",
+                                "move": move_played,
+                                "fen": incoming_fen,
+                                "pgn": incoming_pgn,
+                                "sender": username,
+                                "whiteTime": game.white_time,
+                                "blackTime": game.black_time,
+                                "lastMoveTime": game.last_move_time
+                            })
                 except Exception as e:
                     db.rollback()
                     print(f"❌ [DB ERROR] Failed to save move: {e}", flush=True)
                 finally:
                     db.close()
-
-            # Broadcast move back to room clients if a move occurred
-            if msg_type == "MOVE":
-                await manager.broadcast(game_id, {
-                    "type": "MOVE",
-                    "move": move_played,
-                    "fen": incoming_fen,
-                    "pgn": incoming_pgn,
-                    "sender": username
-                })
 
     except WebSocketDisconnect:
         manager.disconnect(game_id, websocket)
