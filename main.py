@@ -91,26 +91,34 @@ class ConnectionManager:
 
     async def connect(self, game_id: str, websocket: WebSocket):
         await websocket.accept()
-        if game_id not in self.active_connections:
-            self.active_connections[game_id] = []
-        self.active_connections[game_id].append(websocket)
+        key = str(game_id)
+        if key not in self.active_connections:
+            self.active_connections[key] = []
+        self.active_connections[key].append(websocket)
+        print(f"🟢 [WS ROOM JOINED] Room: {key} | Connections in room: {len(self.active_connections[key])}", flush=True)
 
     def disconnect(self, game_id: str, websocket: WebSocket):
-        if game_id in self.active_connections:
-            if websocket in self.active_connections[game_id]:
-                self.active_connections[game_id].remove(websocket)
-            if not self.active_connections[game_id]:
-                del self.active_connections[game_id]
+        key = str(game_id)
+        if key in self.active_connections:
+            if websocket in self.active_connections[key]:
+                self.active_connections[key].remove(websocket)
+            if not self.active_connections[key]:
+                del self.active_connections[key]
 
     async def broadcast(self, game_id: str, message: dict):
+        key = str(game_id)
         print(f"==================================================", flush=True)
-        print(f"📢 [WS BROADCAST] Game: {game_id}", flush=True)
+        print(f"📢 [WS BROADCAST] Game Room: {key}", flush=True)
         print(f"Data: {json.dumps(message, indent=2)}", flush=True)
         print(f"==================================================", flush=True)
 
-        if game_id in self.active_connections:
-            for connection in self.active_connections[game_id]:
-                await connection.send_json(message)
+        if key in self.active_connections:
+            # Iterate copy of list to prevent modification exceptions during loop
+            for connection in list(self.active_connections[key]):
+                try:
+                    await connection.send_json(message)
+                except Exception as e:
+                    print(f"⚠️ Failed sending to socket: {e}", flush=True)
 
 manager = ConnectionManager()
 
@@ -129,7 +137,6 @@ class MatchRequest(BaseModel):
 def read_root():
     return {"status": "ok", "message": "Chess Magic Backend is running!"}
 
-# Helper to create match from queue
 def create_game_from_queue(p1: Dict, p2_username: str, db: Session) -> ChessGame:
     minutes = p1.get("minutes", 5)
     increment = float(p1.get("increment", 0))
@@ -150,7 +157,6 @@ def create_game_from_queue(p1: Dict, p2_username: str, db: Session) -> ChessGame
     db.refresh(new_game)
     return new_game
 
-# 🟢 Queue Matchmaking (Registered users)
 @app.post("/api/game/matchmake")
 def matchmake(req: MatchRequest, db: Session = Depends(get_db)):
     global waiting_queue
@@ -190,7 +196,6 @@ def matchmake(req: MatchRequest, db: Session = Depends(get_db)):
         "message": "Looking for opponent..."
     }
 
-# 🟢 Queue Matchmaking (Guest players)
 @app.post("/api/game/start-guest")
 def start_guest_game(req: MatchRequest, db: Session = Depends(get_db)):
     global waiting_queue
@@ -274,7 +279,6 @@ async def websocket_endpoint(
     try:
         game = db_init.query(ChessGame).filter(ChessGame.id == int(game_id)).first()
         if game:
-            # Fetch past chat history for game
             chats = db_init.query(ChatMessage).filter(ChatMessage.game_id == int(game_id)).order_by(ChatMessage.timestamp.asc()).all()
             chat_history = [
                 {
@@ -362,32 +366,34 @@ async def websocket_endpoint(
                 is_system = data.get("isSystem", False)
 
                 if text:
+                    sender_name = "System" if is_system else username
+                    formatted_time = datetime.datetime.now().strftime("%H:%M")
+                    
                     db = SessionLocal()
                     try:
                         chat_entry = ChatMessage(
                             game_id=int(game_id),
-                            sender=username if not is_system else "System",
+                            sender=sender_name,
                             text=text,
                             is_system=is_system,
                             timestamp=datetime.datetime.utcnow()
                         )
                         db.add(chat_entry)
                         db.commit()
-
-                        formatted_time = datetime.datetime.now().strftime("%H:%M")
-
-                        await manager.broadcast(game_id, {
-                            "type": "CHAT",
-                            "sender": username if not is_system else "System",
-                            "text": text,
-                            "isSystem": is_system,
-                            "timestamp": formatted_time
-                        })
                     except Exception as e:
                         db.rollback()
                         print(f"❌ [DB ERROR] Chat save failed: {e}", flush=True)
                     finally:
                         db.close()
+
+                    # Always broadcast to active sockets in room
+                    await manager.broadcast(game_id, {
+                        "type": "CHAT",
+                        "sender": sender_name,
+                        "text": text,
+                        "isSystem": is_system,
+                        "timestamp": formatted_time
+                    })
 
             # --- EVENT 3: TIME CONTROL ADJUSTMENT ---
             elif msg_type == "SET_TIME_CONTROL":
@@ -418,8 +424,11 @@ async def websocket_endpoint(
                     db.close()
 
     except WebSocketDisconnect:
-        manager.disconnect(game_id, websocket)
         print(f"🔴 [WS DISCONNECTED] Game: {game_id} | User: {username}", flush=True)
+    except Exception as e:
+        print(f"⚠️ [WS ERROR] Unexpected error: {e}", flush=True)
+    finally:
+        manager.disconnect(game_id, websocket)
         await manager.broadcast(game_id, {
             "type": "SYSTEM",
             "message": f"Player {username} disconnected."
